@@ -1,0 +1,3 @@
+ignore .DS_Store
+ignore __pycache__
+ignore .streamlit/secrets.toml
