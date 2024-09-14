@@ -8,13 +8,6 @@ from datetime import datetime
 import altair as alt  # Import Altair for advanced charting
 from streamlit_autorefresh import st_autorefresh
 
-# MQTT broker details
-MQTT_BROKER = "550400ab5c0a4d15a091aa8699ccccf9.s1.eu.hivemq.cloud"
-MQTT_PORT = 8883  # SSL/TLS port
-MQTT_TOPIC = "picow/temperature"
-MQTT_CLIENT_ID = "streamlit_subscriber"
-MQTT_USERNAME = "hoshang"
-MQTT_PASSWORD = "Micropython1"
 
 # Auto-refresh the app every 5 seconds
 st_autorefresh(interval=2500, key="refresh")
