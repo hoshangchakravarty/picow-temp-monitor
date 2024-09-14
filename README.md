@@ -2,6 +2,8 @@
 
 Welcome to the **Real-Time Temperature Monitoring System**! 🚀
 
+![Working Image](https://i.imgur.com/ccp9XSx.jpeg)
+
 This project integrates **IoT devices**, **real-time data streaming**, and **advanced data visualization** to create a sophisticated temperature monitoring solution. Using a **Raspberry Pi Pico W**, MQTT protocol, and a Streamlit web application, this project demonstrates how to capture, process, and display temperature data in real time. 🌡️📈
 
 ## Table of Contents
@@ -47,8 +49,6 @@ This project integrates **IoT devices**, **real-time data streaming**, and **adv
 ---
 
 ## Architecture
-
-![Architecture Diagram](architecture.png) <!-- Placeholder for an architecture diagram -->
 
 The system consists of:
 
