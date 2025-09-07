@@ -84,8 +84,10 @@ except queue.Empty:
 
 # ---------- DataFrame (force native pandas to avoid "narwhals" warning) ----------
 df = st.session_state['data']
-# Convert to a fresh native pandas DataFrame for Altair every render
 df = pd.DataFrame(df).copy()
+if hasattr(df, "to_pandas"):   # Narwhals compatibility
+    df = df.to_pandas()
+
 
 if not df.empty:
     df['Timestamp'] = pd.to_datetime(df['Timestamp'], errors='coerce')
