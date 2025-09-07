@@ -5,22 +5,23 @@ import threading
 import queue
 import pandas as pd
 from datetime import datetime
-import altair as alt  # Import Altair for advanced charting
+import altair as alt
 from streamlit_autorefresh import st_autorefresh
 
+# Optional: avoid Altair data limits & weird dataset reuse issues
+alt.data_transformers.enable('default', max_rows=None)
 
-# Auto-refresh the app every 5 seconds
+# Auto-refresh ~2.5s
 st_autorefresh(interval=2500, key="refresh")
 
-# Initialize session_state variables
-if 'temperature' not in st.session_state:
-    st.session_state['temperature'] = None
+# ---- Session state ----
+if 'generation' not in st.session_state:
+    st.session_state['generation'] = None
 
-if 'temperature_data' not in st.session_state:
-    # Initialize with empty DataFrame
-    st.session_state['temperature_data'] = pd.DataFrame(columns=['Timestamp', 'Temperature'])
+if 'generation_data' not in st.session_state:
+    st.session_state['generation_data'] = pd.DataFrame(columns=['Timestamp', 'Generation'])
 
-# Use st.cache_resource to initialize the MQTT client and message queue only once
+# ---- MQTT setup (cached) ----
 @st.cache_resource
 def init_mqtt_client():
     message_queue = queue.Queue()
@@ -28,152 +29,95 @@ def init_mqtt_client():
     def on_connect(client, userdata, flags, rc):
         if rc == 0:
             print("Connected to MQTT Broker!")
-            client.subscribe(st.secrets.MQTT_TOPIC)
+            client.subscribe(st.secrets.MQTT_TOPIC)   # e.g., "picow/generation"
             print(f"Subscribed to topic: {st.secrets.MQTT_TOPIC}")
         else:
             print(f"Failed to connect, return code {rc}")
 
     def on_message(client, userdata, msg):
-        temperature = float(msg.payload.decode('utf-8'))
-        print(f"Received temperature: {temperature}°C from topic: {msg.topic}")
-        # Put the temperature into the queue without accessing st.session_state
-        message_queue.put(temperature)
+        try:
+            value = float(msg.payload.decode('utf-8'))
+            message_queue.put(value)
+        except Exception as e:
+            print("Bad payload:", e)
 
     def mqtt_client():
-        # Create an MQTT client instance with MQTT v3.1.1 protocol
-        client = mqtt.Client(client_id=st.secrets.MQTT_CLIENT_ID, protocol=mqtt.MQTTv311)
+        c = mqtt.Client(client_id=st.secrets.MQTT_CLIENT_ID, protocol=mqtt.MQTTv311)
+        c.username_pw_set(st.secrets.MQTT_USERNAME, st.secrets.MQTT_PASSWORD)
+        c.tls_set(cert_reqs=ssl.CERT_NONE, tls_version=ssl.PROTOCOL_TLSv1_2)
+        c.tls_insecure_set(True)
+        c.on_connect = on_connect
+        c.on_message = on_message
+        c.connect(st.secrets.MQTT_BROKER, st.secrets.MQTT_PORT, keepalive=60)
+        c.loop_forever()
 
-        # Set username and password
-        client.username_pw_set(st.secrets.MQTT_USERNAME, st.secrets.MQTT_PASSWORD)
-
-        # Configure TLS/SSL settings
-        client.tls_set(
-            cert_reqs=ssl.CERT_NONE,  # Disable certificate verification
-            tls_version=ssl.PROTOCOL_TLSv1_2,  # Use TLS v1.2
-        )
-        client.tls_insecure_set(True)  # Allow insecure server connections
-
-        # Assign event callbacks
-        client.on_connect = on_connect
-        client.on_message = on_message
-
-        # Connect to the broker
-        client.connect(st.secrets.MQTT_BROKER, st.secrets.MQTT_PORT, keepalive=60)
-
-        # Start the network loop
-        client.loop_forever()
-
-    # Start MQTT client in a separate thread
-    mqtt_thread = threading.Thread(target=mqtt_client, name="MQTTThread")
-    mqtt_thread.daemon = True
-    mqtt_thread.start()
-
+    t = threading.Thread(target=mqtt_client, name="MQTTThread", daemon=True)
+    t.start()
     return message_queue
 
-# Initialize the MQTT client and get the message queue
 message_queue = init_mqtt_client()
 
-# Streamlit app layout
-st.title("Real-time Generation from Village 📡")
+# ---- UI ----
+st.title("Real-time Solar Generation ⚡️☀️")
 
-# Placeholder for temperature display
-temperature_placeholder = st.empty()
-
-# Placeholder for the line chart
+current_placeholder = st.empty()
 chart_placeholder = st.empty()
 
-# Update temperature from the queue
+# Drain the queue without blocking
 try:
     while True:
-        temperature = message_queue.get_nowait()
-        st.session_state['temperature'] = temperature
+        gen = message_queue.get_nowait()
+        st.session_state['generation'] = gen
 
-        # Append the new temperature to the DataFrame
-        new_data = pd.DataFrame({
+        new_row = pd.DataFrame({
             'Timestamp': [datetime.now()],
-            'Temperature': [temperature]
+            'Generation': [gen]  # expect % or W depending on your publisher
         })
-
-        if st.session_state['temperature_data'].empty:
-            # Assign directly if the DataFrame is empty
-            st.session_state['temperature_data'] = new_data
-        else:
-            # Concatenate if the DataFrame is not empty
-            st.session_state['temperature_data'] = pd.concat(
-                [st.session_state['temperature_data'], new_data],
-                ignore_index=True
-            )
+        st.session_state['generation_data'] = pd.concat(
+            [st.session_state['generation_data'], new_row],
+            ignore_index=True
+        )
 except queue.Empty:
     pass
 
-# Display the current temperature
-if st.session_state['temperature'] is not None:
-    temperature_placeholder.markdown(f"### Current Generation: {st.session_state['temperature']}°C ⚡️")
+# Current value
+if st.session_state['generation'] is not None:
+    # If your Pico sends % brightness: append " %"
+    current_placeholder.markdown(
+        f"### Current Generation: {st.session_state['generation']} %"
+    )
 else:
-    temperature_placeholder.markdown("Waiting for data...")
+    current_placeholder.markdown("Waiting for data...")
 
-# Display the live line chart with magnified Y-axis
-if not st.session_state['temperature_data'].empty:
-    # Ensure Timestamp is datetime
-    st.session_state['temperature_data']['Timestamp'] = pd.to_datetime(
-        st.session_state['temperature_data']['Timestamp']
+# Chart
+df = st.session_state['generation_data']
+if not df.empty:
+    # Ensure dtype and pass a fresh copy to Altair to avoid "Unrecognized data set"
+    df = df.copy()
+    df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+
+    # Y-range padding
+    y_min = df['Generation'].min()
+    y_max = df['Generation'].max()
+    pad = (y_max - y_min) * 0.2 if y_max != y_min else 1
+    y_domain = [y_min - pad, y_max + pad]
+
+    chart = (
+        alt.Chart(df)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X('Timestamp:T', title='Time'),
+            y=alt.Y('Generation:Q', title='Generation (%)', scale=alt.Scale(domain=y_domain)),
+            tooltip=[alt.Tooltip('Timestamp:T'), alt.Tooltip('Generation:Q', title='Generation')]
+        )
+        .properties(title='Live Generation Readings', width=700, height=400)
+        .interactive()
     )
 
-    # Set the index to the Timestamp for better plotting (optional)
-    temp_data = st.session_state['temperature_data']
-
-    # Calculate min and max temperature for Y-axis range
-    min_temp = temp_data['Temperature'].min()
-    max_temp = temp_data['Temperature'].max()
-    temp_range = max_temp - min_temp
-
-    # Add padding to the Y-axis range
-    padding = temp_range * 0.2 if temp_range != 0 else 1  # Avoid zero padding
-    y_min = min_temp - padding
-    y_max = max_temp + padding
-
-    # Create Altair line chart
-    line_chart = alt.Chart(temp_data).mark_line(point=True).encode(
-        x=alt.X('Timestamp:T', title='Time'),
-        y=alt.Y('Temperature:Q', title='Temperature (°C)', scale=alt.Scale(domain=[y_min, y_max])),
-        tooltip=['Timestamp:T', 'Temperature:Q']
-    ).properties(
-        width=700,
-        height=400,
-        title='Live Generation Readings'
-    ).interactive()  # Enable zoom and pan
-
-    # Display the chart
-    chart_placeholder.altair_chart(line_chart, use_container_width=True)
+    chart_placeholder.altair_chart(chart, use_container_width=True)
 else:
     chart_placeholder.markdown("Waiting for data to plot...")
 
 st.markdown("""
 This project showcases the integration of **IoT devices**, **real-time data streaming**, and **advanced data visualization** to create a sophisticated solar energy generation monitoring solution. Below, you'll find live generation data from a Raspberry Pi Pico W, beautifully plotted for your analysis. ☀️⚡
-
-### 🌟 **Key Features**
-
-- **Real-time Data Acquisition** 📡  
-  - Utilizes the **MQTT protocol** over secure **SSL/TLS** connections to receive solar generation data from the Raspberry Pi Pico W in real time.  
-  - The Raspberry Pi Pico W reads light intensity through an LDR (as a proxy for solar panel output) and publishes generation values to an MQTT broker at regular intervals.  
-
-- **Concurrency and Multithreading** 🧵  
-  - Implements a separate **thread** for the MQTT client using Python's `threading` module.  
-  - Ensures the Streamlit app remains responsive while continuously listening for incoming MQTT messages.  
-
-- **Thread-safe Data Sharing** 🔒  
-  - Employs a **thread-safe queue** to safely communicate between the MQTT client thread and the main Streamlit thread.  
-  - Uses **Streamlit's `st.session_state`** to maintain state across script reruns without causing race conditions.  
-
-- **Advanced Data Visualization** 🎨  
-  - Leverages **Altair** to create an interactive **live line chart** of the solar generation data.  
-  - Dynamically adjusts the Y-axis to highlight fluctuations in generation levels throughout the day.  
-  - Adds interactive features like tooltips, zooming, and panning for enhanced energy analysis.  
-
-- **Secure Communication** 🔐  
-  - Configures SSL/TLS settings to establish a secure connection with the MQTT broker.  
-  - Uses TLS v1.2 protocol and handles certificates appropriately for testing purposes.  
-
----
-
 """)
