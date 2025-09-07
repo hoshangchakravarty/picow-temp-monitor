@@ -74,7 +74,7 @@ def init_mqtt_client():
 message_queue = init_mqtt_client()
 
 # Streamlit app layout
-st.title("Real-time Temperature Data from Raspberry Pi Pico W 📡")
+st.title("Real-time Generation from Village 📡")
 
 # Placeholder for temperature display
 temperature_placeholder = st.empty()
@@ -108,7 +108,7 @@ except queue.Empty:
 
 # Display the current temperature
 if st.session_state['temperature'] is not None:
-    temperature_placeholder.markdown(f"### Current Temperature: {st.session_state['temperature']}°C 🌡️")
+    temperature_placeholder.markdown(f"### Current Generation: {st.session_state['temperature']}°C ⚡️")
 else:
     temperature_placeholder.markdown("Waiting for data...")
 
@@ -140,7 +140,7 @@ if not st.session_state['temperature_data'].empty:
     ).properties(
         width=700,
         height=400,
-        title='Live Temperature Readings'
+        title='Live Generation Readings'
     ).interactive()  # Enable zoom and pan
 
     # Display the chart
@@ -149,30 +149,30 @@ else:
     chart_placeholder.markdown("Waiting for data to plot...")
 
 st.markdown("""
-This project showcases the integration of **IoT devices**, **real-time data streaming**, and **advanced data visualization** to create a sophisticated temperature monitoring solution. Below, you'll find live temperature readings from a Raspberry Pi Pico W, beautifully plotted for your analysis. 📈
+This project showcases the integration of **IoT devices**, **real-time data streaming**, and **advanced data visualization** to create a sophisticated solar energy generation monitoring solution. Below, you'll find live generation data from a Raspberry Pi Pico W, beautifully plotted for your analysis. ☀️⚡
 
 ### 🌟 **Key Features**
 
-- **Real-time Data Acquisition** 📡
-  - Utilizes the **MQTT protocol** over secure **SSL/TLS** connections to receive temperature data from the Raspberry Pi Pico W in real time.
-  - The Raspberry Pi Pico W reads temperature data from its internal sensor and publishes it to an MQTT broker at regular intervals.
+- **Real-time Data Acquisition** 📡  
+  - Utilizes the **MQTT protocol** over secure **SSL/TLS** connections to receive solar generation data from the Raspberry Pi Pico W in real time.  
+  - The Raspberry Pi Pico W reads light intensity through an LDR (as a proxy for solar panel output) and publishes generation values to an MQTT broker at regular intervals.  
 
-- **Concurrency and Multithreading** 🧵
-  - Implements a separate **thread** for the MQTT client using Python's `threading` module.
-  - Ensures the Streamlit app remains responsive while continuously listening for incoming MQTT messages.
+- **Concurrency and Multithreading** 🧵  
+  - Implements a separate **thread** for the MQTT client using Python's `threading` module.  
+  - Ensures the Streamlit app remains responsive while continuously listening for incoming MQTT messages.  
 
-- **Thread-safe Data Sharing** 🔒
-  - Employs a **thread-safe queue** to safely communicate between the MQTT client thread and the main Streamlit thread.
-  - Uses **Streamlit's `st.session_state`** to maintain state across script reruns without causing race conditions.
+- **Thread-safe Data Sharing** 🔒  
+  - Employs a **thread-safe queue** to safely communicate between the MQTT client thread and the main Streamlit thread.  
+  - Uses **Streamlit's `st.session_state`** to maintain state across script reruns without causing race conditions.  
 
-- **Advanced Data Visualization** 🎨
-  - Leverages **Altair** to create an interactive **live line chart** of the temperature data.
-  - Magnifies small temperature variations by dynamically adjusting the Y-axis scale based on the data range.
-  - Adds interactive features like tooltips, zooming, and panning for enhanced data analysis.
+- **Advanced Data Visualization** 🎨  
+  - Leverages **Altair** to create an interactive **live line chart** of the solar generation data.  
+  - Dynamically adjusts the Y-axis to highlight fluctuations in generation levels throughout the day.  
+  - Adds interactive features like tooltips, zooming, and panning for enhanced energy analysis.  
 
-- **Secure Communication** 🔐
-  - Configures SSL/TLS settings to establish a secure connection with the MQTT broker.
-  - Uses TLS v1.2 protocol and handles certificates appropriately for testing purposes.
+- **Secure Communication** 🔐  
+  - Configures SSL/TLS settings to establish a secure connection with the MQTT broker.  
+  - Uses TLS v1.2 protocol and handles certificates appropriately for testing purposes.  
 
 ---
 
