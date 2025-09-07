@@ -89,27 +89,26 @@ try:
         typ, val, ts = q.get_nowait()
         if typ == "gen":
             st.session_state['gen'] = val
+            new_row = pd.DataFrame({'Timestamp': [ts], 'Generation': [val]})
             st.session_state['data'] = pd.concat(
-                [st.session_state['data'], pd.DataFrame({'Timestamp': [ts], 'Generation': [val]})],
-                ignore_index=True
-            )
+                [st.session_state['data'], new_row], ignore_index=True
+            ).dropna(subset=['Timestamp', 'Generation'])
         elif typ == "blackout":
             if val != st.session_state['blackout_state']:
                 st.session_state['blackout_state'] = val
+                new_row = pd.DataFrame({'Timestamp': [ts], 'State': [val]})
                 st.session_state['blackouts'] = pd.concat(
-                    [st.session_state['blackouts'], pd.DataFrame({'Timestamp': [ts], 'State': [val]})],
-                    ignore_index=True
-                )
+                    [st.session_state['blackouts'], new_row], ignore_index=True
+                ).dropna(subset=['Timestamp', 'State'])
 except queue.Empty:
     pass
 
 # ---------- Prep Data ----------
-df = st.session_state['data'].copy()
-blk = st.session_state['blackouts'].copy()
+df = st.session_state['data'].to_pandas().copy()
+blk = st.session_state['blackouts'].to_pandas().copy()
 
 # Clean blackout log
 if not blk.empty:
-    blk = blk.copy()
     blk['Timestamp'] = pd.to_datetime(blk['Timestamp'], errors='coerce')
     blk['State'] = pd.to_numeric(blk['State'], errors='coerce').fillna(-1).astype(int)
     blk = blk.dropna(subset=['Timestamp'])
