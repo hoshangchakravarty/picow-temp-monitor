@@ -104,8 +104,19 @@ except queue.Empty:
     pass
 
 # ---------- Prep Data ----------
-df = st.session_state['data'].to_pandas().copy()
-blk = st.session_state['blackouts'].to_pandas().copy()
+def ensure_pandas(df):
+    # If it's already pandas, just return
+    if isinstance(df, pd.DataFrame):
+        return df
+    # If it's a narwhals DataFrame or something else, convert
+    try:
+        return df.to_pandas().copy()
+    except AttributeError:
+        return pd.DataFrame(df).copy()
+
+df = ensure_pandas(st.session_state['data']).copy()
+blk = ensure_pandas(st.session_state['blackouts']).copy()
+
 
 # Clean blackout log
 if not blk.empty:
