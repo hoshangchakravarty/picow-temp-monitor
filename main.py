@@ -53,7 +53,7 @@ def init_mqtt_client():
             print("Bad payload:", e)
 
     def worker():
-        c = mqtt.Client(client_id=st.secrets.MQTT_CLIENT_ID, protocol=mqtt.MQTTv311)
+        c = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.V1, client_id=st.secrets.MQTT_CLIENT_ID, protocol=mqtt.MQTTv311)
         c.username_pw_set(st.secrets.MQTT_USERNAME, st.secrets.MQTT_PASSWORD)
         c.tls_set(cert_reqs=ssl.CERT_NONE, tls_version=ssl.PROTOCOL_TLSv1_2)
         c.tls_insecure_set(True)
