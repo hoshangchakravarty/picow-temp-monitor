@@ -26,7 +26,7 @@ input_type = st.sidebar.selectbox("Incoming MQTT Value", ["Percent 0–100", "Wa
 smooth_window = st.sidebar.slider("Smoothing Window (samples)", 1, 20, 4)
 clear_btn = st.sidebar.button("🧹 Clear Data")
 st.sidebar.markdown("---")
-st.sidebar.caption("This simulates village-scale microgrid generation using IoT & MQTT.")
+st.sidebar.caption("Village microgrid demo • IoT + MQTT + Streamlit")
 
 # ---------- Session State ----------
 if 'gen' not in st.session_state:
@@ -41,6 +41,7 @@ def init_mqtt_client():
 
     def on_connect(client, userdata, flags, rc):
         if rc == 0:
+            # Subscribe to your topics (e.g. "picow/generation")
             client.subscribe(st.secrets.MQTT_TOPIC)
         else:
             print("MQTT connect failed:", rc)
@@ -74,22 +75,29 @@ try:
         v = q.get_nowait()
         st.session_state['gen'] = v
         st.session_state['data'] = pd.concat(
-            [st.session_state['data'], pd.DataFrame({'Timestamp': [datetime.now()], 'Generation': [v]})],
+            [st.session_state['data'],
+             pd.DataFrame({'Timestamp': [datetime.now()], 'Generation': [v]})],
             ignore_index=True
         )
 except queue.Empty:
     pass
 
-# Safe copy for analysis
-df = st.session_state['data'].copy()
+# ---------- DataFrame (force native pandas to avoid "narwhals" warning) ----------
+df = st.session_state['data']
+# Convert to a fresh native pandas DataFrame for Altair every render
+df = pd.DataFrame(df).copy()
+
 if not df.empty:
-    df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+    df['Timestamp'] = pd.to_datetime(df['Timestamp'], errors='coerce')
+    df = df.dropna(subset=['Timestamp'])
+
+    # Smoothing
     if smooth_window > 1 and len(df) >= smooth_window:
         df['Gen_smooth'] = df['Generation'].rolling(window=smooth_window, min_periods=1).mean()
     else:
         df['Gen_smooth'] = df['Generation']
 
-    # Compute Power
+    # Compute Power (W)
     if input_type == "Percent 0–100":
         df['Power_W'] = (df['Gen_smooth'].clip(lower=0) / 100.0) * panel_rating_w
         value_label = "Generation (%)"
@@ -97,10 +105,10 @@ if not df.empty:
         df['Power_W'] = df['Gen_smooth'].clip(lower=0)
         value_label = "Generation (W)"
 
-    # Compute Energy from real time deltas
+    # Energy from true time deltas
     df = df.sort_values('Timestamp')
     df['dt_h'] = df['Timestamp'].diff().dt.total_seconds().fillna(0) / 3600.0
-    df.loc[df['dt_h'] > 0.2, 'dt_h'] = 0.0
+    df.loc[df['dt_h'] > 0.2, 'dt_h'] = 0.0  # ignore huge gaps
     df['Wh_increment'] = df['Power_W'] * df['dt_h']
     df['Energy_kWh'] = df['Wh_increment'].cumsum() / 1000.0
 
@@ -114,9 +122,6 @@ if df.empty:
     colC.metric("Cumulative Energy", "—")
     colD.metric("Samples", "0")
 else:
-    last_ts = df['Timestamp'].iloc[-1]
-    offline = (datetime.now() - last_ts) > timedelta(seconds=10)
-
     current_val = df['Generation'].iloc[-1]
     peak_val = df['Generation'].max()
     total_kwh = df['Energy_kWh'].iloc[-1]
@@ -130,47 +135,52 @@ else:
     colC.metric("Cumulative Energy", f"{total_kwh:.4f} kWh")
     colD.metric("Samples", f"{len(df)}")
 
-    if offline:
-        st.warning("⚠️ No new data for 10+ seconds (device offline?)")
+    # ⚠️ Blackout rule: warn when CURRENT generation is exactly 0 %
+    if input_type == "Percent 0–100" and round(current_val, 2) == 0.0:
+        st.error("🛑 Blackout detected: current generation is 0 %")
 
 # ---------- Charts ----------
 if not df.empty:
-    # Colors
+    # Theme colors
     eco_green = "#2ca02c"
     eco_blue = "#1f77b4"
     eco_orange = "#ff7f0e"
 
     x_time = alt.X('Timestamp:T', title='Time')
 
-    # Live Generation (% or W)
+    # 1) Live Generation (% or W)
     if input_type == "Percent 0–100":
         y = alt.Y('Gen_smooth:Q', title='Generation (%)')
         gen_chart = alt.Chart(df).mark_line(color=eco_green, point=True).encode(
             x=x_time, y=y,
-            tooltip=[alt.Tooltip('Timestamp:T'), alt.Tooltip('Gen_smooth:Q', title='Generation (%)', format='.2f')]
+            tooltip=[alt.Tooltip('Timestamp:T'),
+                     alt.Tooltip('Gen_smooth:Q', title='Generation (%)', format='.2f')]
         ).properties(title='🌞 Live Generation (%)', height=280)
     else:
         y = alt.Y('Power_W:Q', title='Power (W)')
         gen_chart = alt.Chart(df).mark_line(color=eco_green, point=True).encode(
             x=x_time, y=y,
-            tooltip=[alt.Tooltip('Timestamp:T'), alt.Tooltip('Power_W:Q', title='Power (W)', format='.1f')]
+            tooltip=[alt.Tooltip('Timestamp:T'),
+                     alt.Tooltip('Power_W:Q', title='Power (W)', format='.1f')]
         ).properties(title='🌞 Live Power Output (W)', height=280)
 
-    # Instantaneous Power
+    # 2) Instant Power (area)
     power_area = alt.Chart(df).mark_area(color=eco_blue, opacity=0.4).encode(
         x=x_time,
         y=alt.Y('Power_W:Q', title='Power (W)'),
-        tooltip=[alt.Tooltip('Timestamp:T'), alt.Tooltip('Power_W:Q', title='Power (W)', format='.1f')]
+        tooltip=[alt.Tooltip('Timestamp:T'),
+                 alt.Tooltip('Power_W:Q', title='Power (W)', format='.1f')]
     ).properties(title='⚡ Instantaneous Power', height=220)
 
-    # Cumulative Energy
+    # 3) Cumulative Energy (kWh)
     energy_area = alt.Chart(df).mark_area(color=eco_orange, opacity=0.4).encode(
         x=x_time,
         y=alt.Y('Energy_kWh:Q', title='Cumulative Energy (kWh)'),
-        tooltip=[alt.Tooltip('Timestamp:T'), alt.Tooltip('Energy_kWh:Q', title='Energy (kWh)', format='.5f')]
+        tooltip=[alt.Tooltip('Timestamp:T'),
+                 alt.Tooltip('Energy_kWh:Q', title='Energy (kWh)', format='.5f')]
     ).properties(title='📈 Cumulative Energy Generated', height=220)
 
-    # Distribution
+    # 4) Distribution
     hist = alt.Chart(df).mark_bar(color=eco_green, opacity=0.8).encode(
         x=alt.X('Power_W:Q', bin=alt.Bin(maxbins=30), title='Power (W)'),
         y=alt.Y('count():Q', title='Samples'),
@@ -193,8 +203,8 @@ if not df.empty:
 # ---------- Footer ----------
 st.markdown(
     """
-    <div style="opacity:0.8; font-size:0.9rem; text-align:center; margin-top: 0.5rem;">
-      🌍 This demo shows how IoT can empower <b>village microgrids</b> to monitor solar generation in real time.<br>
+    <div style="opacity:0.85; font-size:0.9rem; text-align:center; margin-top: 0.5rem;">
+      🌍 Monitoring renewable energy for <b>village microgrids</b> in real time.<br>
       Built with <b>Raspberry Pi Pico W</b> · Data over <b>MQTT</b> · Visualized in <b>Streamlit</b>.
     </div>
     """,
