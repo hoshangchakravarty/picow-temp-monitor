@@ -7,7 +7,6 @@ import pandas as pd
 from datetime import datetime, timedelta
 import altair as alt
 from streamlit_autorefresh import st_autorefresh
-import time as _time
 
 # ---------- Page Setup ----------
 st.set_page_config(
@@ -17,8 +16,8 @@ st.set_page_config(
 )
 alt.data_transformers.enable('default', max_rows=None)
 
-# Gentle auto-refresh (UI tick only), not too frequent
-st_autorefresh(interval=4000, key="ui_tick")
+# Auto-refresh ~2.5s
+st_autorefresh(interval=2500, key="refresh")
 
 # ---------- Sidebar Controls ----------
 st.sidebar.header("⚙️ Microgrid Settings")
@@ -27,56 +26,29 @@ input_type = st.sidebar.selectbox("Incoming MQTT Value", ["Percent 0–100", "Wa
 smooth_window = st.sidebar.slider("Smoothing Window (samples)", 1, 20, 4)
 clear_btn = st.sidebar.button("🧹 Clear Data")
 st.sidebar.markdown("---")
-st.sidebar.caption("Village microgrid simulation powered by Pico W + MQTT + Streamlit.")
-
-# ---------- Topics ----------
-GEN_TOPIC = st.secrets.get("MQTT_TOPIC", "picow/generation")
-BLACKOUT_TOPIC = st.secrets.get("MQTT_TOPIC_BLACKOUT", "picow/blackout")
-ROOT_SUB = "picow/#"  # wildcard subscribe so we never miss subtopics
+st.sidebar.caption("This simulates village-scale microgrid generation using IoT & MQTT.")
 
 # ---------- Session State ----------
-def init_state():
-    if 'gen' not in st.session_state:
-        st.session_state['gen'] = None
-    if 'data' not in st.session_state or clear_btn:
-        st.session_state['data'] = pd.DataFrame(columns=['Timestamp', 'Generation'])
-    if 'blackout_state' not in st.session_state:
-        st.session_state['blackout_state'] = 0
-    if 'blackouts' not in st.session_state or clear_btn:
-        st.session_state['blackouts'] = pd.DataFrame(columns=['Timestamp', 'State'])
-    if 'last_render_ts' not in st.session_state:
-        st.session_state['last_render_ts'] = 0.0
-    if 'points_since_render' not in st.session_state:
-        st.session_state['points_since_render'] = 0
-
-init_state()
+if 'gen' not in st.session_state:
+    st.session_state['gen'] = None
+if 'data' not in st.session_state or clear_btn:
+    st.session_state['data'] = pd.DataFrame(columns=['Timestamp', 'Generation'])
 
 # ---------- MQTT Client ----------
 @st.cache_resource
-def init_mqtt_client(root_subscribe: str):
+def init_mqtt_client():
     q = queue.Queue()
 
     def on_connect(client, userdata, flags, rc):
         if rc == 0:
-            client.subscribe(root_subscribe)  # subscribe to all picow/*
-            print(f"Subscribed: {root_subscribe}")
+            client.subscribe(st.secrets.MQTT_TOPIC)
         else:
             print("MQTT connect failed:", rc)
 
     def on_message(client, userdata, msg):
         try:
-            payload = msg.payload.decode('utf-8').strip()
-            # Debug:
-            print("RX", msg.topic, payload)
-            now = datetime.now()
-
-            if msg.topic.endswith("/generation"):
-                val = float(payload)
-                q.put(("gen", val, now))
-
-            elif msg.topic.endswith("/blackout"):
-                state = 1 if payload in ("1", "true", "True") else 0
-                q.put(("blackout", state, now))
+            val = float(msg.payload.decode('utf-8'))
+            q.put(val)
         except Exception as e:
             print("Bad payload:", e)
 
@@ -94,199 +66,129 @@ def init_mqtt_client(root_subscribe: str):
     t.start()
     return q
 
-q = init_mqtt_client(ROOT_SUB)
+q = init_mqtt_client()
 
-# ---------- Ingest New Samples (non-blocking) ----------
-new_points = 0
+# ---------- Ingest New Samples ----------
 try:
     while True:
-        typ, val, ts = q.get_nowait()
-        if typ == "gen":
-            st.session_state['gen'] = val
-            new_row = pd.DataFrame({'Timestamp': [ts], 'Generation': [val]})
-            st.session_state['data'] = pd.concat(
-                [st.session_state['data'], new_row],
-                ignore_index=True
-            ).dropna(subset=['Timestamp', 'Generation'])
-            new_points += 1
-
-        elif typ == "blackout":
-            if val != st.session_state['blackout_state']:
-                st.session_state['blackout_state'] = val
-                new_row = pd.DataFrame({'Timestamp': [ts], 'State': [val]})
-                st.session_state['blackouts'] = pd.concat(
-                    [st.session_state['blackouts'], new_row],
-                    ignore_index=True
-                ).dropna(subset=['Timestamp', 'State'])
-                new_points += 1
+        v = q.get_nowait()
+        st.session_state['gen'] = v
+        st.session_state['data'] = pd.concat(
+            [st.session_state['data'], pd.DataFrame({'Timestamp': [datetime.now()], 'Generation': [v]})],
+            ignore_index=True
+        )
 except queue.Empty:
     pass
 
-# Increment render counter
-st.session_state['points_since_render'] += new_points
-
-# ---------- Helpers ----------
-def ensure_native(df):
-    # Normalize narwhals -> pandas, or pass-through if already pandas
-    try:
-        return df.to_native().copy()
-    except AttributeError:
-        return df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame(df)
-
-def outage_duration_today(blk_df: pd.DataFrame) -> timedelta:
-    if blk_df.empty:
-        return timedelta(0)
-    start_of_day = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    end_of_day = datetime.now()
-    starts = blk_df.loc[blk_df['State'] == 1, 'Timestamp'].tolist()
-    ends = blk_df.loc[blk_df['State'] == 0, 'Timestamp'].tolist()
-    if ends and (not starts or starts[0] > ends[0]):
-        starts = [start_of_day] + starts
-    if len(starts) > len(ends):
-        ends = ends + [end_of_day]
-    total = timedelta(0)
-    for a, b in zip(starts, ends):
-        a = pd.to_datetime(a).to_pydatetime()
-        b = pd.to_datetime(b).to_pydatetime()
-        s = max(a, start_of_day)
-        e = min(b, end_of_day)
-        if e > s:
-            total += (e - s)
-    return total
-
-# ---------- Prep Data (only if we should redraw) ----------
-NOW_S = _time.time()
-SHOULD_REDRAW = (st.session_state['points_since_render'] >= 2) or (NOW_S - st.session_state['last_render_ts'] >= 4.0)
-
-if SHOULD_REDRAW:
-    df = ensure_native(st.session_state['data'])
-    blk = ensure_native(st.session_state['blackouts'])
-
-    # Clean blackout log
-    if not blk.empty:
-        blk['Timestamp'] = pd.to_datetime(blk['Timestamp'], errors='coerce')
-        blk['State'] = pd.to_numeric(blk['State'], errors='coerce').fillna(-1).astype(int)
-        blk = blk.dropna(subset=['Timestamp'])
-        blk = blk[blk['State'].isin([0, 1])]
-        blk = blk.sort_values('Timestamp')
-
-    # Process generation
-    if not df.empty:
-        df['Timestamp'] = pd.to_datetime(df['Timestamp'], errors='coerce')
-        df = df.dropna(subset=['Timestamp']).sort_values('Timestamp')
-        if smooth_window > 1 and len(df) >= smooth_window:
-            df['Gen_smooth'] = df['Generation'].rolling(window=smooth_window, min_periods=1).mean()
-        else:
-            df['Gen_smooth'] = df['Generation']
-
-        if input_type == "Percent 0–100":
-            df['Power_W'] = (df['Gen_smooth'].clip(lower=0) / 100.0) * panel_rating_w
-        else:
-            df['Power_W'] = df['Gen_smooth'].clip(lower=0)
-
-        df['dt_h'] = df['Timestamp'].diff().dt.total_seconds().fillna(0) / 3600.0
-        df.loc[df['dt_h'] > 0.2, 'dt_h'] = 0.0
-        df['Wh_increment'] = df['Power_W'] * df['dt_h']
-        df['Energy_kWh'] = df['Wh_increment'].cumsum() / 1000.0
+# Safe copy for analysis
+df = st.session_state['data'].copy()
+if not df.empty:
+    df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+    if smooth_window > 1 and len(df) >= smooth_window:
+        df['Gen_smooth'] = df['Generation'].rolling(window=smooth_window, min_periods=1).mean()
     else:
-        df = pd.DataFrame(columns=['Timestamp', 'Generation', 'Gen_smooth', 'Power_W', 'Energy_kWh'])
-        blk = pd.DataFrame(columns=['Timestamp', 'State'])
+        df['Gen_smooth'] = df['Generation']
 
-    # ---------- UI ----------
-    st.title("🌿 Renewable Energy Monitoring for Microgrids in Villages")
-
-    if st.session_state['blackout_state'] == 1:
-        st.error("🚨 BLACKOUT DETECTED — No light measured at the sensor")
-
-    colA, colB, colC, colD, colE = st.columns(5)
-    if df.empty:
-        colA.metric("Current Output", "—")
-        colB.metric("Peak Output", "—")
-        colC.metric("Cumulative Energy", "—")
-        colD.metric("Samples", "0")
-        colE.metric("Outage Today", "—")
+    # Compute Power
+    if input_type == "Percent 0–100":
+        df['Power_W'] = (df['Gen_smooth'].clip(lower=0) / 100.0) * panel_rating_w
+        value_label = "Generation (%)"
     else:
-        last_ts = df['Timestamp'].iloc[-1]
-        offline = (datetime.now() - last_ts) > timedelta(seconds=10)
-        current_val = df['Generation'].iloc[-1]
-        peak_val = df['Generation'].max()
-        total_kwh = df['Energy_kWh'].iloc[-1]
-        outage_td = outage_duration_today(blk)
+        df['Power_W'] = df['Gen_smooth'].clip(lower=0)
+        value_label = "Generation (W)"
 
-        if input_type == "Percent 0–100":
-            colA.metric("Current Output", f"{current_val:.2f} %")
-            colB.metric("Peak Output", f"{peak_val:.2f} %")
-        else:
-            colA.metric("Current Output", f"{df['Power_W'].iloc[-1]:.1f} W")
-            colB.metric("Peak Output", f"{df['Power_W'].max():.1f} W")
-        colC.metric("Cumulative Energy", f"{total_kwh:.4f} kWh")
-        colD.metric("Samples", f"{len(df)}")
-        colE.metric("Outage Today", f"{outage_td}", help="Total blackout time since midnight")
+    # Compute Energy from real time deltas
+    df = df.sort_values('Timestamp')
+    df['dt_h'] = df['Timestamp'].diff().dt.total_seconds().fillna(0) / 3600.0
+    df.loc[df['dt_h'] > 0.2, 'dt_h'] = 0.0
+    df['Wh_increment'] = df['Power_W'] * df['dt_h']
+    df['Energy_kWh'] = df['Wh_increment'].cumsum() / 1000.0
 
-        if offline:
-            st.warning("⚠️ No new data for 10+ seconds (device offline?)")
+# ---------- Header ----------
+st.title("🌿 Renewable Energy Monitoring for Microgrids in Villages")
 
-    # ---------- Charts ----------
-    if not df.empty:
-        eco_green, eco_blue, eco_orange, alert_red = "#2ca02c", "#1f77b4", "#ff7f0e", "#d62728"
-        x_time = alt.X('Timestamp:T', title='Time')
+colA, colB, colC, colD = st.columns(4)
+if df.empty:
+    colA.metric("Current Output", "—")
+    colB.metric("Peak Output", "—")
+    colC.metric("Cumulative Energy", "—")
+    colD.metric("Samples", "0")
+else:
+    last_ts = df['Timestamp'].iloc[-1]
+    offline = (datetime.now() - last_ts) > timedelta(seconds=10)
 
-        blackout_rules = None
-        if not blk.empty:
-            blackout_rules = alt.Chart(blk).mark_rule(color=alert_red, strokeDash=[6, 4]).encode(
-                x='Timestamp:T',
-                tooltip=[alt.Tooltip('Timestamp:T', title='Event'), alt.Tooltip('State:N')]
-            )
+    current_val = df['Generation'].iloc[-1]
+    peak_val = df['Generation'].max()
+    total_kwh = df['Energy_kWh'].iloc[-1]
 
-        if input_type == "Percent 0–100":
-            base = alt.Chart(df).mark_line(color=eco_green, point=True).encode(
-                x=x_time,
-                y=alt.Y('Gen_smooth:Q', title='Generation (%)'),
-                tooltip=['Timestamp:T', alt.Tooltip('Gen_smooth:Q', title='Generation (%)', format='.2f')]
-            ).properties(title='🌞 Live Generation (%)', height=280)
-        else:
-            base = alt.Chart(df).mark_line(color=eco_green, point=True).encode(
-                x=x_time,
-                y=alt.Y('Power_W:Q', title='Power (W)'),
-                tooltip=['Timestamp:T', alt.Tooltip('Power_W:Q', title='Power (W)', format='.1f')]
-            ).properties(title='🌞 Live Power Output (W)', height=280)
+    if input_type == "Percent 0–100":
+        colA.metric("Current Output", f"{current_val:.2f} %")
+        colB.metric("Peak Output", f"{peak_val:.2f} %")
+    else:
+        colA.metric("Current Output", f"{df['Power_W'].iloc[-1]:.1f} W")
+        colB.metric("Peak Output", f"{df['Power_W'].max():.1f} W")
+    colC.metric("Cumulative Energy", f"{total_kwh:.4f} kWh")
+    colD.metric("Samples", f"{len(df)}")
 
-        gen_chart = base if blackout_rules is None else (base + blackout_rules)
-        st.altair_chart(gen_chart.interactive(), use_container_width=True)
+    if offline:
+        st.warning("⚠️ No new data for 10+ seconds (device offline?)")
 
-        base_power = alt.Chart(df).mark_area(color=eco_blue, opacity=0.4).encode(
-            x=x_time,
-            y=alt.Y('Power_W:Q', title='Power (W)'),
-            tooltip=['Timestamp:T', alt.Tooltip('Power_W:Q', title='Power (W)', format='.1f')]
-        ).properties(title='⚡ Instantaneous Power', height=220)
-        power_area = base_power if blackout_rules is None else (base_power + blackout_rules)
+# ---------- Charts ----------
+if not df.empty:
+    # Colors
+    eco_green = "#2ca02c"
+    eco_blue = "#1f77b4"
+    eco_orange = "#ff7f0e"
 
-        base_energy = alt.Chart(df).mark_area(color=eco_orange, opacity=0.4).encode(
-            x=x_time,
-            y=alt.Y('Energy_kWh:Q', title='Cumulative Energy (kWh)'),
-            tooltip=['Timestamp:T', alt.Tooltip('Energy_kWh:Q', title='Energy (kWh)', format='.5f')]
-        ).properties(title='📈 Cumulative Energy Generated', height=220)
-        energy_area = base_energy if blackout_rules is None else (base_energy + blackout_rules)
+    x_time = alt.X('Timestamp:T', title='Time')
 
-        c1, c2 = st.columns(2)
-        with c1:
-            st.altair_chart(power_area.interactive(), use_container_width=True)
-        with c2:
-            st.altair_chart(energy_area.interactive(), use_container_width=True)
+    # Live Generation (% or W)
+    if input_type == "Percent 0–100":
+        y = alt.Y('Gen_smooth:Q', title='Generation (%)')
+        gen_chart = alt.Chart(df).mark_line(color=eco_green, point=True).encode(
+            x=x_time, y=y,
+            tooltip=[alt.Tooltip('Timestamp:T'), alt.Tooltip('Gen_smooth:Q', title='Generation (%)', format='.2f')]
+        ).properties(title='🌞 Live Generation (%)', height=280)
+    else:
+        y = alt.Y('Power_W:Q', title='Power (W)')
+        gen_chart = alt.Chart(df).mark_line(color=eco_green, point=True).encode(
+            x=x_time, y=y,
+            tooltip=[alt.Tooltip('Timestamp:T'), alt.Tooltip('Power_W:Q', title='Power (W)', format='.1f')]
+        ).properties(title='🌞 Live Power Output (W)', height=280)
 
-        hist = alt.Chart(df).mark_bar(color=eco_green, opacity=0.8).encode(
-            x=alt.X('Power_W:Q', bin=alt.Bin(maxbins=30), title='Power (W)'),
-            y=alt.Y('count():Q', title='Samples'),
-            tooltip=['count():Q']
-        ).properties(title='📊 Distribution of Generation', height=220)
-        st.altair_chart(hist, use_container_width=True)
+    # Instantaneous Power
+    power_area = alt.Chart(df).mark_area(color=eco_blue, opacity=0.4).encode(
+        x=x_time,
+        y=alt.Y('Power_W:Q', title='Power (W)'),
+        tooltip=[alt.Tooltip('Timestamp:T'), alt.Tooltip('Power_W:Q', title='Power (W)', format='.1f')]
+    ).properties(title='⚡ Instantaneous Power', height=220)
 
-        csv = df[['Timestamp', 'Generation', 'Gen_smooth', 'Power_W', 'Energy_kWh']].to_csv(index=False).encode('utf-8')
-        st.download_button("⬇️ Download Microgrid Data (CSV)", data=csv, file_name="village_microgrid.csv", mime="text/csv")
+    # Cumulative Energy
+    energy_area = alt.Chart(df).mark_area(color=eco_orange, opacity=0.4).encode(
+        x=x_time,
+        y=alt.Y('Energy_kWh:Q', title='Cumulative Energy (kWh)'),
+        tooltip=[alt.Tooltip('Timestamp:T'), alt.Tooltip('Energy_kWh:Q', title='Energy (kWh)', format='.5f')]
+    ).properties(title='📈 Cumulative Energy Generated', height=220)
 
-    # Update render timers/counters
-    st.session_state['last_render_ts'] = NOW_S
-    st.session_state['points_since_render'] = 0
+    # Distribution
+    hist = alt.Chart(df).mark_bar(color=eco_green, opacity=0.8).encode(
+        x=alt.X('Power_W:Q', bin=alt.Bin(maxbins=30), title='Power (W)'),
+        y=alt.Y('count():Q', title='Samples'),
+        tooltip=[alt.Tooltip('count():Q', title='Samples')]
+    ).properties(title='📊 Distribution of Generation', height=220)
+
+    # Layout
+    st.altair_chart(gen_chart.interactive(), use_container_width=True)
+    c1, c2 = st.columns(2)
+    with c1:
+        st.altair_chart(power_area.interactive(), use_container_width=True)
+    with c2:
+        st.altair_chart(energy_area.interactive(), use_container_width=True)
+    st.altair_chart(hist, use_container_width=True)
+
+    # Download CSV
+    csv = df[['Timestamp', 'Generation', 'Gen_smooth', 'Power_W', 'Energy_kWh']].to_csv(index=False).encode('utf-8')
+    st.download_button("⬇️ Download Microgrid Data (CSV)", data=csv, file_name="village_microgrid.csv", mime="text/csv")
 
 # ---------- Footer ----------
 st.markdown(
