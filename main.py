@@ -1,4 +1,6 @@
 # app.py — Renewable Energy Monitoring for Microgrids in Villages
+
+# ---- Silence noisy Narwhals→Altair warning ----
 import warnings
 warnings.filterwarnings(
     "ignore",
@@ -42,63 +44,71 @@ if 'gen' not in st.session_state:
 if 'data' not in st.session_state or clear_btn:
     st.session_state['data'] = pd.DataFrame(columns=['Timestamp', 'Generation'])
 
-# ---------- MQTT Client (cached) ----------
+# Global, bounded queue living in session (so reruns reuse it)
+if 'mqtt_queue' not in st.session_state:
+    st.session_state['mqtt_queue'] = queue.Queue(maxsize=500)
+if 'mqtt_started' not in st.session_state:
+    st.session_state['mqtt_started'] = False
+
+# ---------- MQTT Client (strict singleton, non-blocking loop) ----------
 @st.cache_resource
-def init_mqtt_client():
-    q = queue.Queue(maxsize=500)  # cap queue; we’ll drop oldest if full
+def start_mqtt_client():
+    q = st.session_state['mqtt_queue']
 
     def on_connect(client, userdata, flags, rc):
         if rc == 0:
-            # Primary topic (required)
             client.subscribe(st.secrets.MQTT_TOPIC)  # e.g. "picow/generation"
-            # Optional: second topic (e.g. blackout flag); define MQTT_BLACKOUT in secrets if you need it
-            if "MQTT_BLACKOUT" in st.secrets:
-                client.subscribe(st.secrets.MQTT_BLACKOUT)  # e.g. "picow/blackout"
+            if "MQTT_BLACKOUT" in st.secrets:        # optional extra topic
+                client.subscribe(st.secrets.MQTT_BLACKOUT)
         else:
             print("MQTT connect failed:", rc)
 
     def on_message(client, userdata, msg):
-        try:
-            # Only treat the main topic as numeric data
-            if msg.topic == st.secrets.MQTT_TOPIC:
+        # Only treat the main topic as numeric telemetry
+        if msg.topic == st.secrets.MQTT_TOPIC:
+            try:
                 val = float(msg.payload.decode('utf-8'))
                 if q.full():
-                    try:
-                        q.get_nowait()  # drop oldest
-                    except queue.Empty:
-                        pass
+                    try: q.get_nowait()  # drop oldest
+                    except queue.Empty: pass
                 q.put_nowait(val)
-            else:
-                # Non-numeric side topics can be ignored or handled separately
-                pass
-        except Exception:
-            # Avoid log spam on bad payloads
-            pass
+            except Exception:
+                pass  # ignore bad payloads
 
-    def worker():
-        c = mqtt.Client(client_id=st.secrets.MQTT_CLIENT_ID, protocol=mqtt.MQTTv311)
-        c.username_pw_set(st.secrets.MQTT_USERNAME, st.secrets.MQTT_PASSWORD)
-        c.tls_set(cert_reqs=ssl.CERT_NONE, tls_version=ssl.PROTOCOL_TLSv1_2)
-        c.tls_insecure_set(True)
-        c.on_connect = on_connect
-        c.on_message = on_message
-        c.connect(st.secrets.MQTT_BROKER, st.secrets.MQTT_PORT, keepalive=60)
-        c.loop_forever()
+    client = mqtt.Client(
+        client_id=st.secrets.MQTT_CLIENT_ID,
+        protocol=mqtt.MQTTv311
+    )
+    client.username_pw_set(st.secrets.MQTT_USERNAME, st.secrets.MQTT_PASSWORD)
+    client.tls_set(cert_reqs=ssl.CERT_NONE, tls_version=ssl.PROTOCOL_TLSv1_2)
+    client.tls_insecure_set(True)
+    client.on_connect = on_connect
+    client.on_message = on_message
 
-    t = threading.Thread(target=worker, name="MQTTThread", daemon=True)
-    t.start()
-    return q
+    # Gentle reconnect backoff
+    try:
+        client.reconnect_delay_set(min_delay=1, max_delay=8)
+    except Exception:
+        pass
 
-q = init_mqtt_client()
+    client.connect(st.secrets.MQTT_BROKER, st.secrets.MQTT_PORT, keepalive=60)
+    client.loop_start()  # non-blocking network loop in background thread
+    return client
 
-# ---------- Ingest New Samples (non-blocking) ----------
+# Start MQTT once
+if not st.session_state['mqtt_started']:
+    start_mqtt_client()
+    st.session_state['mqtt_started'] = True
+
+message_queue = st.session_state['mqtt_queue']
+
+# ---------- Ingest New Samples (drain queue quickly) ----------
 try:
     while True:
-        v = q.get_nowait()
+        v = message_queue.get_nowait()
         now = datetime.now()
-
-        st.session_state['gen'] = v
         new_row = pd.DataFrame({'Timestamp': [now], 'Generation': [v]})
+
         if st.session_state['data'].empty:
             st.session_state['data'] = new_row
         else:
@@ -106,12 +116,12 @@ try:
                 [st.session_state['data'], new_row],
                 ignore_index=True
             )
+        st.session_state['gen'] = v
 except queue.Empty:
     pass
 
-# ---------- DataFrame (force native pandas to avoid Narwhals warnings) ----------
+# ---------- DataFrame (force native pandas; fresh copy for charts) ----------
 df = st.session_state['data']
-# convert to truly native pandas (Narwhals-safe)
 if hasattr(df, "to_native"):
     df = df.to_native()
 elif hasattr(df, "to_pandas"):
@@ -125,13 +135,13 @@ if not df.empty:
     df['Timestamp'] = pd.to_datetime(df['Timestamp'], errors='coerce')
     df = df.dropna(subset=['Timestamp']).sort_values('Timestamp')
 
-    # Smoothing (moving average)
+    # Smoothing
     if smooth_window > 1 and len(df) >= smooth_window:
         df['Gen_smooth'] = df['Generation'].rolling(window=smooth_window, min_periods=1).mean()
     else:
         df['Gen_smooth'] = df['Generation']
 
-    # Power
+    # Power (W)
     if input_type == "Percent 0–100":
         df['Power_W'] = (df['Gen_smooth'].clip(lower=0) / 100.0) * panel_rating_w
         value_label = "Generation (%)"
@@ -140,9 +150,8 @@ if not df.empty:
         value_label = "Generation (W)"
 
     # Energy from true time deltas
-    # (limit absurd gaps to keep totals sane)
     dt_sec = df['Timestamp'].diff().dt.total_seconds().fillna(0)
-    dt_sec = dt_sec.clip(lower=0, upper=12 * 60)  # cap at 12 minutes
+    dt_sec = dt_sec.clip(lower=0, upper=12 * 60)  # cap huge gaps
     df['dt_h'] = dt_sec / 3600.0
     df['Wh_increment'] = df['Power_W'] * df['dt_h']
     df['Energy_kWh'] = df['Wh_increment'].cumsum() / 1000.0
@@ -164,7 +173,7 @@ else:
     if input_type == "Percent 0–100":
         colA.metric("Current Output", f"{current_val:.2f} %")
         colB.metric("Peak Output", f"{peak_val:.2f} %")
-        # ⚠️ Blackout logic: current == 0%
+        # Blackout if current == 0 %
         if round(current_val, 2) == 0.0:
             st.error("🛑 Blackout detected: current generation is 0 %")
     else:
