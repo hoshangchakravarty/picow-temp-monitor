@@ -1,76 +1,100 @@
 # streamlit_app.py
 import streamlit as st
-import ssl, threading
+import ssl
 from datetime import datetime
 import paho.mqtt.client as mqtt
 from streamlit_autorefresh import st_autorefresh
-from streamlit.runtime.scriptrunner import add_script_run_ctx  # 👈 attach context
+from queue import Queue, Empty
 
+# ===== Secrets (.streamlit/secrets.toml) =====
 BROKER     = st.secrets["MQTT_BROKER"]
-PORT       = int(st.secrets["MQTT_PORT"])
-TOPIC      = st.secrets["MQTT_TOPIC"]
+PORT       = int(st.secrets["MQTT_PORT"])     # 8883 for HiveMQ Cloud (TLS)
+TOPIC      = st.secrets["MQTT_TOPIC"]         # "picow/gen"
 CLIENT_ID  = st.secrets["MQTT_CLIENT_ID"]
 USERNAME   = st.secrets["MQTT_USERNAME"]
 PASSWORD   = st.secrets["MQTT_PASSWORD"]
 
+# ===== Page =====
 st.set_page_config(page_title="PicoW Generation Monitor", page_icon="🔆", layout="centered")
 st.title("🔆 PicoW Generation Monitor")
 
-# --- thread-safe state (no st.* inside) ---
-_state_lock = threading.Lock()
-_latest = {"val": None, "ts": None, "connected": False}
-
-def _set(val=None, ts=None, connected=None):
-    with _state_lock:
-        if val is not None: _latest["val"] = val
-        if ts  is not None: _latest["ts"]  = ts
-        if connected is not None: _latest["connected"] = connected
-
-def _get():
-    with _state_lock:
-        return _latest["val"], _latest["ts"], _latest["connected"]
-
-# --- MQTT callbacks ---
-def on_connect(client, userdata, flags, rc):
-    _set(connected=(rc == 0))
-    if rc == 0:
-        client.subscribe(TOPIC)
-
-def on_message(client, userdata, msg):
-    try:
-        _set(val=float(msg.payload.decode().strip()), ts=datetime.now())
-    except Exception:
-        pass
-
-# --- background thread with context attached ---
-def start_mqtt():
+# ===== One-time init =====
+if "connected" not in st.session_state:
+    st.session_state.connected = False
+if "latest_val" not in st.session_state:
+    st.session_state.latest_val = None
+if "latest_ts" not in st.session_state:
+    st.session_state.latest_ts = None
+if "q" not in st.session_state:
+    st.session_state.q = Queue()
+if "mqtt_started" not in st.session_state:
+    # Create client once
     client = mqtt.Client(client_id=CLIENT_ID, clean_session=True)
     client.username_pw_set(USERNAME, PASSWORD)
-    client.tls_set_context(ssl.create_default_context())   # TLS
+
+    # TLS for HiveMQ Cloud
+    ctx = ssl.create_default_context()
+    client.tls_set_context(ctx)
+
+    # ---- MQTT callbacks (NO Streamlit calls inside) ----
+    def on_connect(c, u, f, rc):
+        # push status into queue; main thread will update UI state
+        st.session_state.q.put(("connected", (rc == 0)))
+        if rc == 0:
+            c.subscribe(TOPIC)
+
+    def on_message(c, u, msg):
+        try:
+            val = float(msg.payload.decode().strip())
+            st.session_state.q.put(("value", (val, datetime.now())))
+        except Exception:
+            pass
+
     client.on_connect = on_connect
     client.on_message = on_message
     client.connect(BROKER, PORT, keepalive=60)
-    client.loop_forever()
+    client.loop_start()  # background network loop managed by Paho
+    st.session_state.mqtt_started = True
 
-if "mqtt_thread_started" not in st.session_state:
-    t = threading.Thread(target=start_mqtt, daemon=True, name="start_mqtt")
-    add_script_run_ctx(t)  # 👈 this silences the ScriptRunContext warning
-    t.start()
-    st.session_state.mqtt_thread_started = True
+# ===== Drain queue (main thread only) =====
+def drain_queue():
+    updated = False
+    while True:
+        try:
+            kind, payload = st.session_state.q.get_nowait()
+        except Empty:
+            break
+        if kind == "connected":
+            st.session_state.connected = payload
+            updated = True
+        elif kind == "value":
+            val, ts = payload
+            st.session_state.latest_val = val
+            st.session_state.latest_ts = ts
+            updated = True
+    return updated
 
-# --- UI ---
-st_autorefresh(interval=2000, key="refresh")
+drain_queue()
+
+# ===== Header info =====
 c1, c2 = st.columns(2)
 c1.write("**Broker**: " + BROKER)
 c2.write("**Topic**: " + TOPIC)
 
-val, ts, connected = _get()
+# ===== Auto-refresh every 2s =====
+st_autorefresh(interval=2000, key="refresh")
+
+# ===== UI =====
+val = st.session_state.latest_val
+ts  = st.session_state.latest_ts
 if val is not None:
     st.metric("Current Generation", f"{val:.2f} %")
     if ts:
         age = (datetime.now() - ts).total_seconds()
         st.caption(f"Last update: {ts.strftime('%H:%M:%S')} (~{int(age)}s ago)")
-elif connected:
+elif st.session_state.connected:
     st.info("Connected to MQTT. Waiting for first message…")
 else:
     st.warning("Connecting to MQTT…")
+
+st.caption("This page refreshes every 2s. Pico W publishes every ~2s.")
