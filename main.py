@@ -1,9 +1,10 @@
 # streamlit_app.py
 import streamlit as st
-import ssl
+import ssl, threading
 from datetime import datetime
 import paho.mqtt.client as mqtt
 from streamlit_autorefresh import st_autorefresh
+from streamlit.runtime.scriptrunner import add_script_run_ctx  # 👈 attach context
 
 BROKER     = st.secrets["MQTT_BROKER"]
 PORT       = int(st.secrets["MQTT_PORT"])
@@ -15,48 +16,61 @@ PASSWORD   = st.secrets["MQTT_PASSWORD"]
 st.set_page_config(page_title="PicoW Generation Monitor", page_icon="🔆", layout="centered")
 st.title("🔆 PicoW Generation Monitor")
 
-if "latest" not in st.session_state:
-    st.session_state.latest = None
-if "ts" not in st.session_state:
-    st.session_state.ts = None
-if "connected" not in st.session_state:
-    st.session_state.connected = False
-if "mqtt_client" not in st.session_state:
-    # Create client once
+# --- thread-safe state (no st.* inside) ---
+_state_lock = threading.Lock()
+_latest = {"val": None, "ts": None, "connected": False}
+
+def _set(val=None, ts=None, connected=None):
+    with _state_lock:
+        if val is not None: _latest["val"] = val
+        if ts  is not None: _latest["ts"]  = ts
+        if connected is not None: _latest["connected"] = connected
+
+def _get():
+    with _state_lock:
+        return _latest["val"], _latest["ts"], _latest["connected"]
+
+# --- MQTT callbacks ---
+def on_connect(client, userdata, flags, rc):
+    _set(connected=(rc == 0))
+    if rc == 0:
+        client.subscribe(TOPIC)
+
+def on_message(client, userdata, msg):
+    try:
+        _set(val=float(msg.payload.decode().strip()), ts=datetime.now())
+    except Exception:
+        pass
+
+# --- background thread with context attached ---
+def start_mqtt():
     client = mqtt.Client(client_id=CLIENT_ID, clean_session=True)
     client.username_pw_set(USERNAME, PASSWORD)
-    client.tls_set_context(ssl.create_default_context())
-
-    def on_connect(c, u, f, rc):
-        st.session_state.connected = (rc == 0)
-        if rc == 0:
-            c.subscribe(TOPIC)
-
-    def on_message(c, u, msg):
-        try:
-            st.session_state.latest = float(msg.payload.decode().strip())
-            st.session_state.ts = datetime.now()
-        except Exception:
-            pass
-
+    client.tls_set_context(ssl.create_default_context())   # TLS
     client.on_connect = on_connect
     client.on_message = on_message
     client.connect(BROKER, PORT, keepalive=60)
-    client.loop_start()  # 👈 background network loop handled by Paho
-    st.session_state.mqtt_client = client
+    client.loop_forever()
 
-# UI refresh
+if "mqtt_thread_started" not in st.session_state:
+    t = threading.Thread(target=start_mqtt, daemon=True, name="start_mqtt")
+    add_script_run_ctx(t)  # 👈 this silences the ScriptRunContext warning
+    t.start()
+    st.session_state.mqtt_thread_started = True
+
+# --- UI ---
 st_autorefresh(interval=2000, key="refresh")
 c1, c2 = st.columns(2)
 c1.write("**Broker**: " + BROKER)
 c2.write("**Topic**: " + TOPIC)
 
-if st.session_state.latest is not None:
-    st.metric("Current Generation", f"{st.session_state.latest:.2f} %")
-    if st.session_state.ts:
-        age = (datetime.now() - st.session_state.ts).total_seconds()
-        st.caption(f"Last update: {st.session_state.ts.strftime('%H:%M:%S')} (~{int(age)}s ago)")
-elif st.session_state.connected:
+val, ts, connected = _get()
+if val is not None:
+    st.metric("Current Generation", f"{val:.2f} %")
+    if ts:
+        age = (datetime.now() - ts).total_seconds()
+        st.caption(f"Last update: {ts.strftime('%H:%M:%S')} (~{int(age)}s ago)")
+elif connected:
     st.info("Connected to MQTT. Waiting for first message…")
 else:
     st.warning("Connecting to MQTT…")
